@@ -1,16 +1,18 @@
 package main
 
 import (
-	"aliher/tryraft/impl"
 	"bufio"
 	"errors"
 	"fmt"
-	"github.com/c-bata/go-prompt"
-	"github.com/coreos/etcd/raft/raftpb"
 	"io"
 	"os"
 	"strconv"
 	"strings"
+
+	"aliher/tryraft/impl"
+	"aliher/tryraft/repl"
+	"github.com/c-bata/go-prompt"
+	"github.com/coreos/etcd/raft/raftpb"
 )
 
 // TODO:
@@ -20,12 +22,15 @@ import (
 // - restart node
 // - add new node
 // - remove node
+// - snapshotting to truncate log
+// - auto tick till next event
+// - converge after op?
 // enhancements
 // - better completion
 // - argument flags
 // - colors for prompt?
 
-type repl struct {
+type Repl struct {
 	setup   bool
 	cluster *impl.Cluster
 	inbox   map[uint64][]raftpb.Message
@@ -36,8 +41,8 @@ type repl struct {
 	hist []string
 }
 
-func (*repl) completer(in prompt.Document) []prompt.Suggest {
-	s := []prompt.Suggest{
+func (*Repl) completer(in prompt.Document) []prompt.Suggest {
+	commandsSuggest := []prompt.Suggest{
 		{Text: "init", Description: "Create initial group membership list"},
 		{Text: "add", Description: "Add a node to the cluster <id> <via>"},
 		{Text: "start", Description: "Start raft node"},
@@ -48,6 +53,18 @@ func (*repl) completer(in prompt.Document) []prompt.Suggest {
 		{Text: "drop", Description: "Drop messages from node to node"},
 		{Text: "campaign", Description: "Try to become a leader"},
 		{Text: "exit", Description: "Terminate program"},
+	}
+	commandArgs := map[string][]prompt.Suggest{
+		"drop": {
+			{Text: "from", Description: "Filter messages from nodes"},
+			{Text: "to", Description: "Filter messages to nodes"},
+		},
+	}
+	parts := strings.Split(in.CurrentLineBeforeCursor(), " ")
+	s := commandsSuggest
+	if len(parts) > 1 {
+		cmd := parts[0]
+		s = commandArgs[cmd]
 	}
 	return prompt.FilterHasPrefix(s, in.GetWordBeforeCursor(), true)
 }
@@ -79,7 +96,7 @@ func iterFile(filename string, handler func(line string) error) error {
 	return err
 }
 
-func (r *repl) init() {
+func (r *Repl) init() {
 	if err := iterFile(historyFile, func(line string) error {
 		r.hist = append(r.hist, line[:len(line)-1])
 		return nil
@@ -90,7 +107,7 @@ func (r *repl) init() {
 	r.inbox = make(map[uint64][]raftpb.Message)
 }
 
-func (r *repl) run() {
+func (r *Repl) run() {
 	prev := ""
 	if len(r.hist) > 0 {
 		prev = r.hist[len(r.hist)-1]
@@ -162,7 +179,7 @@ func (s *status) append(sectionNum int, line string) {
 	(*s)[sectionNum] = append((*s)[sectionNum], line)
 }
 
-func (r *repl) fullClusterStatus() string {
+func (r *Repl) fullClusterStatus() string {
 	var allLines []string
 
 	ns := r.cluster.Nodes()
@@ -219,82 +236,13 @@ func (r *repl) fullClusterStatus() string {
 	return strings.Join(allLines, "\n")
 }
 
-type cmd struct {
-	cmd   string
-	named map[string]string
-	pos   []string
-}
-
-func parse(line string) cmd {
-	result := cmd{
-		named: make(map[string]string),
-	}
-	parts := strings.Fields(line)
-	if len(parts) > 0 {
-		result.cmd = parts[0]
-		for _, part := range parts[1:] {
-			named := strings.Split(part, "=")
-			if len(named) > 1 {
-				result.named[named[0]] = part[len(named[0])+1:]
-			} else {
-				result.pos = append(result.pos, part)
-			}
-		}
-	}
-	return result
-}
-
-func (c cmd) empty() bool {
-	return len(c.cmd) == 0
-}
-
-func (c cmd) getUInt(i interface{}) (uint64, error) {
-	var val string
-	switch key := i.(type) {
-	case string:
-		var ok bool
-		val, ok = c.named[key]
-		if !ok {
-			return 0, errors.New(fmt.Sprintf("parameter %s was not defined", key))
-		}
-	case int:
-		if key < 0 || key > len(c.pos) {
-			return 0, errors.New(fmt.Sprintf("not enough parameters. %d provided, %d reading", len(c.pos), key))
-		}
-		val = c.pos[key]
-	default:
-		panic("can only read indexed and named arguments")
-	}
-	return strconv.ParseUint(val, 10,64)
-}
-
-func (c cmd) getUIntOr(i interface{}, def uint64) (uint64, error) {
-	var val string
-	switch key := i.(type) {
-	case string:
-		var ok bool
-		val, ok = c.named[key]
-		if !ok {
-			return def, nil
-		}
-	case int:
-		if key < 0 || key > len(c.pos) {
-			return def, nil
-		}
-		val = c.pos[key]
-	default:
-		panic("can only read indexed and named arguments")
-	}
-	return strconv.ParseUint(val, 10,64)
-}
-
-func (r *repl) processInput(line string) (bool, error) {
-	cmd := parse(line)
-	if cmd.empty() {
+func (r *Repl) processInput(line string) (bool, error) {
+	cmd := repl.ParseCmd(line)
+	if cmd.IsEmpty() {
 		return true, nil
 	}
 	var err error
-	switch cmd.cmd {
+	switch cmd.Cmd {
 	case "init":
 		err = r.initCluster(cmd)
 	case "start":
@@ -311,6 +259,8 @@ func (r *repl) processInput(line string) (bool, error) {
 		err = r.receiveCmd(cmd)
 	case "campaign":
 		err = r.campaignCmd(cmd)
+	case "drop":
+		err = r.dropCmd(cmd)
 	case "exit":
 		return false, nil
 	default:
@@ -319,7 +269,7 @@ func (r *repl) processInput(line string) (bool, error) {
 	return true, err
 }
 
-func (r *repl) propStatus() string {
+func (r *Repl) propStatus() string {
 	b := strings.Builder{}
 out:
 	for {
@@ -341,7 +291,7 @@ out:
 	return b.String()
 }
 
-func (r *repl) initCluster(c cmd) error {
+func (r *Repl) initCluster(c repl.Cmd) error {
 	if r.setup {
 		return errors.New("cluster peers already initialized")
 	}
@@ -357,7 +307,7 @@ func (r *repl) initCluster(c cmd) error {
 	return nil
 }
 
-func (r *repl) startCmd(c cmd) error {
+func (r *Repl) startCmd(c repl.Cmd) error {
 	nodes, err := r.parseNodeIds(c)
 	if err != nil {
 		return err
@@ -373,7 +323,7 @@ func (r *repl) startCmd(c cmd) error {
 	return nil
 }
 
-func (r *repl) runOnArgNodes(c cmd, orAll bool, f func(nodeId uint64) error) error {
+func (r *Repl) runOnArgNodes(c repl.Cmd, orAll bool, f func(nodeId uint64) error) error {
 	nodes, err := r.parseNodeIds(c)
 	if err != nil {
 		return err
@@ -392,7 +342,7 @@ func (r *repl) runOnArgNodes(c cmd, orAll bool, f func(nodeId uint64) error) err
 	return nil
 }
 
-func (r *repl) processCmd(c cmd) error {
+func (r *Repl) processCmd(c repl.Cmd) error {
 	return r.runOnArgNodes(c, true, func(nodeId uint64) error {
 		messages := r.cluster.Node(nodeId).ProcessMessage()
 		if messages != nil {
@@ -407,16 +357,16 @@ func (r *repl) processCmd(c cmd) error {
 }
 
 // node text
-func (r *repl) proposeCmd(c cmd) error {
-	if len(c.pos) != 2 {
+func (r *Repl) proposeCmd(c repl.Cmd) error {
+	if len(c.Pos) != 2 {
 		return errors.New("expected two params node and proposal data")
 	}
-	nodeId, err := strconv.ParseUint(c.pos[0], 10, 64)
+	nodeId, err := strconv.ParseUint(c.Pos[0], 10, 64)
 	if err != nil {
-		return errors.New(fmt.Sprintf("failed to parse node id '%s'", c.pos[0]))
+		return errors.New(fmt.Sprintf("failed to parse node id '%s'", c.Pos[0]))
 	}
 	if node := r.cluster.Node(nodeId); node != nil {
-		node.Propose(c.pos[1], r.propResults)
+		node.Propose(c.Pos[1], r.propResults)
 		r.posted++
 	} else {
 		fmt.Printf("error: unknown node %d\n", nodeId)
@@ -424,14 +374,14 @@ func (r *repl) proposeCmd(c cmd) error {
 	return nil
 }
 
-func (r *repl) tickCmd(c cmd) error {
+func (r *Repl) tickCmd(c repl.Cmd) error {
 	return r.runOnArgNodes(c, true, func(nodeId uint64) error {
 		r.cluster.Node(nodeId).Tick()
 		return nil
 	})
 }
 
-func (r *repl) parseNodesIDsOrAll(c cmd) ([]uint64, error) {
+func (r *Repl) parseNodesIDsOrAll(c repl.Cmd) ([]uint64, error) {
 	nodes, err := r.parseNodeIds(c)
 	if err != nil {
 		return nil, err
@@ -445,7 +395,7 @@ func (r *repl) parseNodesIDsOrAll(c cmd) ([]uint64, error) {
 	return nodes, err
 }
 
-func (r *repl) checkNodesExist(nodes []uint64) error {
+func (r *Repl) checkNodesExist(nodes []uint64) error {
 	for _, nodeId := range nodes {
 		if r.cluster.Node(nodeId) == nil {
 			return errors.New(fmt.Sprintf("unknown node %d", nodeId))
@@ -454,9 +404,9 @@ func (r *repl) checkNodesExist(nodes []uint64) error {
 	return nil
 }
 
-func (r *repl) parseNodeIds(c cmd) ([]uint64, error) {
+func (r *Repl) parseNodeIds(c repl.Cmd) ([]uint64, error) {
 	var nodes []uint64
-	for _, tok := range c.pos {
+	for _, tok := range c.Pos {
 		nodeId, err := strconv.ParseUint(tok, 10, 64)
 		if err != nil {
 			return nil, errors.New(fmt.Sprintf("failed to parse node id '%s'", tok))
@@ -466,7 +416,7 @@ func (r *repl) parseNodeIds(c cmd) ([]uint64, error) {
 	return nodes, nil
 }
 
-func (r *repl) campaignCmd(c cmd) error {
+func (r *Repl) campaignCmd(c repl.Cmd) error {
 	node, err := r.parseSingleNodeArgs(c)
 	if err != nil {
 		return err
@@ -474,13 +424,13 @@ func (r *repl) campaignCmd(c cmd) error {
 	return node.Campaign()
 }
 
-func (r *repl) parseSingleNodeArgs(c cmd) (*impl.ExampleRaft, error) {
-	if len(c.pos) != 1 {
+func (r *Repl) parseSingleNodeArgs(c repl.Cmd) (*impl.ExampleRaft, error) {
+	if len(c.Pos) != 1 {
 		return nil, errors.New("expecting single node arg")
 	}
-	nodeId, err := strconv.ParseUint(c.pos[0], 10, 64)
+	nodeId, err := strconv.ParseUint(c.Pos[0], 10, 64)
 	if err != nil {
-		return nil, errors.New(fmt.Sprintf("failed to parse node id '%s'", c.pos[0]))
+		return nil, errors.New(fmt.Sprintf("failed to parse node id '%s'", c.Pos[0]))
 	}
 	node := r.cluster.Node(nodeId)
 	if node == nil {
@@ -489,7 +439,7 @@ func (r *repl) parseSingleNodeArgs(c cmd) (*impl.ExampleRaft, error) {
 	return node, nil
 }
 
-func (r *repl) receiveCmd(c cmd) error {
+func (r *Repl) receiveCmd(c repl.Cmd) error {
 	return r.runOnArgNodes(c, true, func(nodeId uint64) error {
 		node := r.cluster.Node(nodeId)
 		for _, msg := range r.inbox[nodeId] {
@@ -500,8 +450,8 @@ func (r *repl) receiveCmd(c cmd) error {
 	})
 }
 
-func (r *repl) addCmd(c cmd) error {
-	via, err := c.getUInt(0)
+func (r *Repl) addCmd(c repl.Cmd) error {
+	via, err := c.GetUInt(0)
 	if err != nil {
 		return err
 	}
@@ -509,7 +459,7 @@ func (r *repl) addCmd(c cmd) error {
 	if node == nil {
 		return errors.New(fmt.Sprintf("node %d not found", via))
 	}
-	newId, err := c.getUInt(1)
+	newId, err := c.GetUInt(1)
 	if err != nil {
 		return err
 	}
@@ -523,10 +473,44 @@ func (r *repl) addCmd(c cmd) error {
 	return nil
 }
 
+func (r *Repl) dropCmd(c repl.Cmd) error {
+	all := r.cluster.Nodes()
+	from, err := c.GetUIntSliceOr("from", all)
+	if err != nil {
+		return err
+	}
+	to, err := c.GetUIntSliceOr("to", all)
+	if err != nil {
+		return err
+	}
+	for node := range r.inbox {
+		if !in(node, to) {
+			continue
+		}
+		var newBox []raftpb.Message
+		for _, m := range r.inbox[node] {
+			if !in(m.From, from) {
+				newBox = append(newBox, m)
+			}
+		}
+		r.inbox[node] = newBox
+	}
+	return nil
+}
+
+func in(node uint64, nodes []uint64) bool {
+	for _, n := range nodes {
+		if n == node {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	fmt.Println("Morning!")
 	c := impl.NewCluster()
-	repl := repl{
+	repl := Repl{
 		cluster: &c,
 	}
 	repl.init()
@@ -552,6 +536,6 @@ func main() {
 }
 
 func main2() {
-	cmd := parse("exit 1 2 t=3 zb=12=3")
+	cmd := repl.ParseCmd("exit 1 2 t=3 zb=12=3")
 	fmt.Printf("%v\n", cmd)
 }
