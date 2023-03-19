@@ -9,14 +9,12 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
 
 	"aliher/tryraft/impl"
 	"aliher/tryraft/repl"
-	"aliher/tryraft/threaddump"
 
 	"github.com/c-bata/go-prompt"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -194,7 +192,6 @@ func (r *Repl) fullClusterStatus() string {
 	var allLines []string
 
 	var ss []status
-	// r.goro()
 	r.cluster.Visit(func(n *impl.ExampleRaft) error {
 		var s status
 		s.append(RAFT_STATE, "State")
@@ -273,8 +270,6 @@ func (r *Repl) processInput(line string) (bool, error) {
 		err = r.dropCmd(cmd)
 	case "next":
 		err = r.nextCmd(cmd)
-	case "go":
-		r.goro()
 	case "exit":
 		return false, nil
 	default:
@@ -526,24 +521,13 @@ func (r *Repl) nextCmd(c repl.Cmd) error {
 	i := 0
 	for ; i < 50; i++ {
 		r.tickCmd(c)
-		runtime.Gosched()
-		// TODO: Check if all goroutines converged
-		// #	0x64ee29	github.com/coreos/etcd/raft.(*node).run+0x929	/home/ali/go/pkg/mod/github.com/coreos/etcd@v3.3.27+incompatible/raft/node.go:313
+		waitForIdle()
 		if r.processPending() {
 			break
 		}
 	}
 	fmt.Printf("Made %d ticks\n", i)
 	return nil
-}
-
-func (r *Repl) goro() {
-	prof := pprof.Lookup("goroutine")
-	if prof == nil {
-		fmt.Println("can't print goro dump")
-	}
-	b := bytes.Buffer{}
-	_ = prof.WriteTo(&b, 0)
 }
 
 func (r *Repl) processPending() bool {
