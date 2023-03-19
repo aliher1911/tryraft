@@ -2,15 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
+	"time"
 
 	"aliher/tryraft/impl"
 	"aliher/tryraft/repl"
+	"aliher/tryraft/threaddump"
+
 	"github.com/c-bata/go-prompt"
 	"github.com/coreos/etcd/raft/raftpb"
 )
@@ -51,6 +58,7 @@ func (*Repl) completer(in prompt.Document) []prompt.Suggest {
 		{Text: "propose", Description: "Propose next value via node"},
 		{Text: "receive", Description: "Consume pending messages from other nodes"},
 		{Text: "drop", Description: "Drop messages from node to node"},
+		{Text: "next", Description: "Do next sensible action: either process, receive or tick till process is needed"},
 		{Text: "campaign", Description: "Try to become a leader"},
 		{Text: "exit", Description: "Terminate program"},
 	}
@@ -130,13 +138,16 @@ func (r *Repl) run() {
 		}
 		if line != prev {
 			r.hist = append(r.hist, line)
-			if hist, err := os.OpenFile(historyFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 644); err == nil {
+			if hist, err := os.OpenFile(historyFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 				fmt.Fprintf(hist, "%s\n", line)
 				hist.Close()
 			} else {
 				fmt.Printf("Failed %s\n", err.Error())
 			}
 			prev = line
+		}
+		if err := waitForIdle(); err != nil {
+			fmt.Printf("Internal raft goroutines didn't finish: %s\n", err)
 		}
 	}
 }
@@ -182,23 +193,21 @@ func (s *status) append(sectionNum int, line string) {
 func (r *Repl) fullClusterStatus() string {
 	var allLines []string
 
-	ns := r.cluster.Nodes()
 	var ss []status
-	for _, node := range ns {
+	// r.goro()
+	r.cluster.Visit(func(n *impl.ExampleRaft) error {
 		var s status
-
-		n := r.cluster.Node(node)
 		s.append(RAFT_STATE, "State")
 		rs := n.Status()
-		s.append(RAFT_STATE, fmt.Sprintf(" ID:      %d", node))
+		s.append(RAFT_STATE, fmt.Sprintf(" ID:      %d", n.ID()))
 		s.append(RAFT_STATE, fmt.Sprintf(" Term:    %d", rs.Term))
 		s.append(RAFT_STATE, fmt.Sprintf(" Commit:  %d", rs.Commit))
-		s.append(RAFT_STATE, fmt.Sprintf(" Applied: %d", rs.Commit))
+		s.append(RAFT_STATE, fmt.Sprintf(" Applied: %d", rs.Applied))
 		s.append(RAFT_STATE, fmt.Sprintf(" State:   %s", rs.RaftState.String()[5:]))
 		s.append(RAFT_STATE, fmt.Sprintf(" Process? %t", n.HasMessage()))
 
 		s.append(INBOX, "Inbox")
-		for _, m := range r.inbox[node] {
+		for _, m := range r.inbox[n.ID()] {
 			s.append(INBOX, fmt.Sprintf(" %d : %s", m.From, m.Type))
 		}
 
@@ -208,7 +217,8 @@ func (r *Repl) fullClusterStatus() string {
 		}
 
 		ss = append(ss, s)
-	}
+		return nil
+	})
 
 	maxWidth := 0
 	for _, s := range ss {
@@ -261,6 +271,10 @@ func (r *Repl) processInput(line string) (bool, error) {
 		err = r.campaignCmd(cmd)
 	case "drop":
 		err = r.dropCmd(cmd)
+	case "next":
+		err = r.nextCmd(cmd)
+	case "go":
+		r.goro()
 	case "exit":
 		return false, nil
 	default:
@@ -498,10 +512,88 @@ func (r *Repl) dropCmd(c repl.Cmd) error {
 	return nil
 }
 
+func (r *Repl) nextCmd(c repl.Cmd) error {
+	if r.processPending() {
+		fmt.Println("process")
+		return r.processCmd(c)
+	}
+	for _, msgs := range r.inbox {
+		if len(msgs) > 0 {
+			fmt.Println("receive")
+			return r.receiveCmd(c)
+		}
+	}
+	i := 0
+	for ; i < 50; i++ {
+		r.tickCmd(c)
+		runtime.Gosched()
+		// TODO: Check if all goroutines converged
+		// #	0x64ee29	github.com/coreos/etcd/raft.(*node).run+0x929	/home/ali/go/pkg/mod/github.com/coreos/etcd@v3.3.27+incompatible/raft/node.go:313
+		if r.processPending() {
+			break
+		}
+	}
+	fmt.Printf("Made %d ticks\n", i)
+	return nil
+}
+
+func (r *Repl) goro() {
+	prof := pprof.Lookup("goroutine")
+	if prof == nil {
+		fmt.Println("can't print goro dump")
+	}
+	b := bytes.Buffer{}
+	_ = prof.WriteTo(&b, 0)
+}
+
+func (r *Repl) processPending() bool {
+	process := false
+	r.cluster.Visit(func(n *impl.ExampleRaft) error {
+		process = process || n.HasMessage()
+		return nil
+	})
+	return process
+}
+
 func in(node uint64, nodes []uint64) bool {
 	for _, n := range nodes {
 		if n == node {
 			return true
+		}
+	}
+	return false
+}
+
+// waitForidle waits until all goroutines except for main (#1) will block
+// on select. It it takes more than a second(-ish), error is reported
+func waitForIdle() error {
+	for i := 0; i < 50; i++ {
+		runtime.Gosched()
+		<-time.After(20 * time.Millisecond)
+		if !hasRunningNonMain() {
+			return nil
+		}
+	}
+	return errors.New("goroutines are not idle")
+}
+
+var grre = regexp.MustCompile(`goroutine ([0-9]+) \[(.+?)(,.*)?\]`)
+
+// hasRunningNonMain checks if any non main goroutines are not in select
+// state. This is a proxy criteria for all running data to be processed.
+func hasRunningNonMain() bool {
+	buf := make([]byte, 65536)
+	sz := runtime.Stack(buf, true)
+	r := bytes.NewReader(buf[:sz])
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		l := s.Text()
+		m := grre.FindStringSubmatch(l)
+		if m != nil {
+			if m[1] != "1" && m[2] != "select" {
+				fmt.Printf("Unstopped: %s\n", l)
+				return true
+			}
 		}
 	}
 	return false
@@ -533,9 +625,4 @@ func main() {
 		}
 	}
 	repl.run()
-}
-
-func main2() {
-	cmd := repl.ParseCmd("exit 1 2 t=3 zb=12=3")
-	fmt.Printf("%v\n", cmd)
 }

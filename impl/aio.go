@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/coreos/etcd/raft"
-	"github.com/coreos/etcd/raft/raftpb"
+	"io/ioutil"
+	"log"
 	"sort"
 	"strings"
+
+	"github.com/coreos/etcd/raft"
+	"github.com/coreos/etcd/raft/raftpb"
 )
 
 // ExampleRaft wraps real raft node hiding nitty-gritty interactions
@@ -32,14 +35,12 @@ func NewRaft(nodeId uint64, storage *raft.MemoryStorage, peers ...uint64) *Examp
 		HeartbeatTick:   1,
 		Storage:         storage,
 		MaxInflightMsgs: 5,
-		//Logger:          nil,
+		Logger:          &raft.DefaultLogger{Logger: log.New(ioutil.Discard, "", 0)},
 	}
-	// Need to add other group members
+	// Need to add all initial group members
 	peerIDs := []raft.Peer{}
 	for _, id := range peers {
-		if id != nodeId+99999 {
-			peerIDs = append(peerIDs, raft.Peer{ID: id})
-		}
+		peerIDs = append(peerIDs, raft.Peer{ID: id})
 	}
 	node := raft.StartNode(raftCfg, peerIDs)
 	return &ExampleRaft{id: nodeId, node: node, storage: storage}
@@ -55,6 +56,10 @@ func RestartRaft(nodeId uint64, storage *raft.MemoryStorage) *ExampleRaft {
 	}
 	node := raft.RestartNode(raftCfg)
 	return &ExampleRaft{node: node, storage: storage}
+}
+
+func (e *ExampleRaft) ID() uint64 {
+	return e.id
 }
 
 func (e *ExampleRaft) Tick() {
@@ -293,6 +298,15 @@ func (c *Cluster) Nodes() []uint64 {
 	return nodeIds
 }
 
+func (c *Cluster) Visit(f func(n *ExampleRaft) error) error {
+	for _, id := range c.Nodes() {
+		if err := f(c.nodes[id]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Cluster) AddPeer(nodeId uint64) {
-	c.peers[nodeId] = struct {}{}
+	c.peers[nodeId] = struct{}{}
 }
